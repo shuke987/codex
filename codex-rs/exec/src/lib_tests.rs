@@ -285,7 +285,7 @@ fn runtime_warnings_are_filtered_to_the_primary_thread() {
         should_process_notification(
             &ServerNotification::Warning(warning),
             primary_thread_id,
-            turn_id,
+            Some(turn_id),
         )
     });
 
@@ -309,7 +309,9 @@ fn runtime_warnings_are_filtered_to_the_primary_thread() {
             ..recovery
         }),
     ]
-    .map(|notification| should_process_notification(&notification, primary_thread_id, turn_id));
+    .map(|notification| {
+        should_process_notification(&notification, primary_thread_id, Some(turn_id))
+    });
 
     assert_eq!(outcomes, [true, true, false, false]);
 }
