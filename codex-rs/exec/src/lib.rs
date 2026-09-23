@@ -36,6 +36,9 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadGoalSetParams;
+use codex_app_server_protocol::ThreadGoalSetResponse;
+use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
@@ -179,9 +182,40 @@ enum InitialOperation {
         items: Vec<UserInput>,
         output_schema: Option<Value>,
     },
+    Goal {
+        objective: String,
+    },
     Review {
         review_request: ReviewRequest,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecGoalState {
+    Disabled,
+    Active,
+    Terminal,
+}
+
+impl ExecGoalState {
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    fn update_from_status(&mut self, status: ThreadGoalStatus) {
+        *self = match status {
+            ThreadGoalStatus::Active => Self::Active,
+            ThreadGoalStatus::Paused
+            | ThreadGoalStatus::Blocked
+            | ThreadGoalStatus::UsageLimited
+            | ThreadGoalStatus::BudgetLimited
+            | ThreadGoalStatus::Complete => Self::Terminal,
+        };
+    }
 }
 
 enum StdinPromptBehavior {
@@ -220,6 +254,7 @@ struct ExecRunArgs {
     resume_approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
     dangerously_bypass_approvals_and_sandbox: bool,
     exec_span: tracing::Span,
+    goal: bool,
     images: Vec<PathBuf>,
     json_mode: bool,
     last_message_file: Option<PathBuf>,
@@ -268,6 +303,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         thread_source,
         skip_git_repo_check,
         ephemeral,
+        goal,
         ignore_user_config,
         ignore_rules,
         color,
@@ -726,6 +762,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         resume_approvals_reviewer_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span: exec_span.clone(),
+        goal,
         images,
         json_mode,
         last_message_file,
@@ -826,6 +863,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         resume_approvals_reviewer_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span,
+        goal,
         images,
         json_mode,
         last_message_file,
@@ -868,13 +906,60 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let default_approval_policy = config.permissions.approval_policy.value();
     let default_effort = config.model_reasoning_effort.clone();
 
-    let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
-        (Some(ExecCommand::Review(review_cli)), _, _) => {
+    let (initial_operation, prompt_summary) = match (goal, command.as_ref(), prompt, images) {
+        (true, Some(ExecCommand::Fork(_)), _, _) => {
+            anyhow::bail!("`codex exec --goal` cannot be combined with `fork`");
+        }
+        (true, Some(ExecCommand::Review(_)), _, _) => {
+            return Err(anyhow::anyhow!(
+                "`codex exec --goal` cannot be combined with `review`"
+            ));
+        }
+        (true, Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
+            if !imgs.is_empty() || !args.images.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "`codex exec --goal` does not support image inputs"
+                ));
+            }
+            let prompt_arg = args
+                .prompt
+                .clone()
+                .or_else(|| {
+                    if args.last {
+                        args.session_id.clone()
+                    } else {
+                        None
+                    }
+                })
+                .or(root_prompt);
+            let objective = resolve_prompt(prompt_arg);
+            (
+                InitialOperation::Goal {
+                    objective: objective.clone(),
+                },
+                objective,
+            )
+        }
+        (true, None, root_prompt, imgs) => {
+            if !imgs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "`codex exec --goal` does not support image inputs"
+                ));
+            }
+            let objective = resolve_root_prompt(root_prompt);
+            (
+                InitialOperation::Goal {
+                    objective: objective.clone(),
+                },
+                objective,
+            )
+        }
+        (false, Some(ExecCommand::Review(review_cli)), _, _) => {
             let review_request = build_review_request(review_cli)?;
             let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
             (InitialOperation::Review { review_request }, summary)
         }
-        (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
+        (false, Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
             let prompt_arg = args
                 .prompt
                 .clone()
@@ -906,7 +991,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 prompt_text,
             )
         }
-        (Some(ExecCommand::Fork(args)), root_prompt, imgs) => {
+        (false, Some(ExecCommand::Fork(args)), root_prompt, imgs) => {
             let prompt_arg = args.prompt.clone().or(root_prompt);
             if let Some(prompt_arg) = prompt_arg {
                 let prompt_text = resolve_prompt(Some(prompt_arg));
@@ -937,7 +1022,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 (InitialOperation::ForkOnly, String::new())
             }
         }
-        (None, root_prompt, imgs) => {
+        (false, None, root_prompt, imgs) => {
             let prompt_text = resolve_root_prompt(root_prompt);
             let mut items: Vec<UserInput> = imgs
                 .into_iter()
@@ -1118,7 +1203,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let task_id = match initial_operation {
+    let mut goal_state = ExecGoalState::Disabled;
+    let mut current_turn_id = None;
+    let mut current_turn_active = false;
+    match initial_operation {
         InitialOperation::ForkOnly => {
             request_shutdown(&client, &mut request_ids, &primary_thread_id_for_span)
                 .await
@@ -1172,7 +1260,34 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?;
             let task_id = response.turn.id;
             info!("Sent prompt with event ID: {task_id}");
-            task_id
+            exec_span.record("turn.id", task_id.as_str());
+            current_turn_id = Some(task_id);
+            current_turn_active = true;
+        }
+        InitialOperation::Goal { objective } => {
+            let response: ThreadGoalSetResponse = send_request_with_response(
+                &client,
+                ClientRequest::ThreadGoalSet {
+                    request_id: request_ids.next(),
+                    params: ThreadGoalSetParams {
+                        thread_id: primary_thread_id_for_span.clone(),
+                        objective: Some(objective),
+                        status: Some(ThreadGoalStatus::Active),
+                        token_budget: Some(None),
+                    },
+                },
+                "thread/goal/set",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            if response.goal.status != ThreadGoalStatus::Active {
+                return Err(anyhow::anyhow!(
+                    "goal was not active after thread/goal/set: {:?}",
+                    response.goal.status
+                ));
+            }
+            goal_state = ExecGoalState::Active;
+            info!("Started goal mode for thread {primary_thread_id_for_span}");
         }
         InitialOperation::Review { review_request } => {
             let response: ReviewStartResponse = send_request_with_response(
@@ -1197,10 +1312,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             ));
             let task_id = response.turn.id;
             info!("Sent review request with event ID: {task_id}");
-            task_id
+            exec_span.record("turn.id", task_id.as_str());
+            current_turn_id = Some(task_id);
+            current_turn_active = true;
         }
-    };
-    exec_span.record("turn.id", task_id.as_str());
+    }
 
     // Run the loop until the task is complete.
     // Track whether a fatal error was reported by the server so we can
@@ -1215,13 +1331,25 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     interrupt_channel_open = false;
                     continue;
                 }
+                let Some(turn_id) = current_turn_id.clone() else {
+                    if let Err(err) = request_shutdown(
+                        &client,
+                        &mut request_ids,
+                        &primary_thread_id_for_requests,
+                    )
+                    .await
+                    {
+                        warn!("thread/unsubscribe failed during interrupt shutdown: {err}");
+                    }
+                    break;
+                };
                 if let Err(err) = send_request_with_response::<TurnInterruptResponse>(
                     &client,
                     ClientRequest::TurnInterrupt {
                         request_id: request_ids.next(),
                         params: TurnInterruptParams {
                             thread_id: primary_thread_id_for_requests.clone(),
-                            turn_id: task_id.clone(),
+                            turn_id,
                         },
                     },
                     "turn/interrupt",
@@ -1247,14 +1375,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 let mut notification = *notification;
                 if let ServerNotification::Error(payload) = &notification {
                     if payload.thread_id == primary_thread_id_for_requests
-                        && payload.turn_id == task_id
+                        && turn_id_matches(payload.turn_id.as_str(), current_turn_id.as_deref())
                         && !payload.will_retry
                     {
                         error_seen = true;
                     }
                 } else if let ServerNotification::TurnCompleted(payload) = &notification
                     && payload.thread_id == primary_thread_id_for_requests
-                    && payload.turn.id == task_id
+                    && turn_id_matches(payload.turn.id.as_str(), current_turn_id.as_deref())
                     && matches!(
                         payload.turn.status,
                         codex_app_server_protocol::TurnStatus::Failed
@@ -1264,10 +1392,19 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     error_seen = true;
                 }
 
+                update_goal_mode_tracking(
+                    &notification,
+                    &primary_thread_id_for_requests,
+                    &mut current_turn_id,
+                    &mut current_turn_active,
+                    &mut goal_state,
+                    &exec_span,
+                );
+
                 if should_process_notification(
                     &notification,
                     &primary_thread_id_for_requests,
-                    &task_id,
+                    current_turn_id.as_deref(),
                 ) {
                     maybe_backfill_turn_completed_items(
                         config.ephemeral,
@@ -1280,18 +1417,29 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
-                            if let Err(err) = request_shutdown(
-                                &client,
-                                &mut request_ids,
-                                &primary_thread_id_for_requests,
-                            )
-                            .await
-                            {
-                                warn!("thread/unsubscribe failed during shutdown: {err}");
+                            if !goal_state.is_active() || error_seen {
+                                if let Err(err) = request_shutdown(
+                                    &client,
+                                    &mut request_ids,
+                                    &primary_thread_id_for_requests,
+                                )
+                                .await
+                                {
+                                    warn!("thread/unsubscribe failed during shutdown: {err}");
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
+                } else if goal_state.is_enabled() && !goal_state.is_active() && !current_turn_active
+                {
+                    if let Err(err) =
+                        request_shutdown(&client, &mut request_ids, &primary_thread_id_for_requests)
+                            .await
+                    {
+                        warn!("thread/unsubscribe failed during goal shutdown: {err}");
+                    }
+                    break;
                 }
             }
             InProcessServerEvent::Lagged { skipped } => {
@@ -1575,10 +1723,57 @@ fn lagged_event_warning_message(skipped: usize) -> String {
     format!("in-process app-server event stream lagged; dropped {skipped} events")
 }
 
+fn update_goal_mode_tracking(
+    notification: &ServerNotification,
+    thread_id: &str,
+    current_turn_id: &mut Option<String>,
+    current_turn_active: &mut bool,
+    goal_state: &mut ExecGoalState,
+    exec_span: &tracing::Span,
+) {
+    if !goal_state.is_enabled() {
+        return;
+    }
+
+    match notification {
+        ServerNotification::TurnStarted(notification) if notification.thread_id == thread_id => {
+            let turn_id = notification.turn.id.clone();
+            exec_span.record("turn.id", turn_id.as_str());
+            *current_turn_id = Some(turn_id);
+            *current_turn_active = true;
+        }
+        ServerNotification::TurnCompleted(notification)
+            if notification.thread_id == thread_id
+                && turn_id_matches(notification.turn.id.as_str(), current_turn_id.as_deref()) =>
+        {
+            *current_turn_active = false;
+        }
+        ServerNotification::ThreadGoalUpdated(notification)
+            if notification.thread_id == thread_id =>
+        {
+            goal_state.update_from_status(notification.goal.status);
+        }
+        ServerNotification::ThreadGoalCleared(notification)
+            if notification.thread_id == thread_id =>
+        {
+            *goal_state = ExecGoalState::Terminal;
+        }
+        _ => {}
+    }
+}
+
+fn turn_id_matches(candidate: &str, turn_id: Option<&str>) -> bool {
+    turn_id.is_none_or(|turn_id| candidate == turn_id)
+}
+
+fn optional_turn_id_matches(candidate: Option<&str>, turn_id: Option<&str>) -> bool {
+    turn_id.is_none_or(|turn_id| candidate.is_none_or(|candidate| candidate == turn_id))
+}
+
 fn should_process_notification(
     notification: &ServerNotification,
     thread_id: &str,
-    turn_id: &str,
+    turn_id: Option<&str>,
 ) -> bool {
     match notification {
         ServerNotification::ConfigWarning(_) | ServerNotification::DeprecationNotice(_) => true,
@@ -1589,51 +1784,56 @@ fn should_process_notification(
             .is_none_or(|candidate| candidate == thread_id),
         ServerNotification::AuthRecoveryStarted(notification)
         | ServerNotification::AuthRecoveryCompleted(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::Error(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::HookCompleted(notification) => {
             notification.thread_id == thread_id
-                && notification
-                    .turn_id
-                    .as_deref()
-                    .is_none_or(|candidate| candidate == turn_id)
+                && optional_turn_id_matches(notification.turn_id.as_deref(), turn_id)
         }
         ServerNotification::HookStarted(notification) => {
             notification.thread_id == thread_id
-                && notification
-                    .turn_id
-                    .as_deref()
-                    .is_none_or(|candidate| candidate == turn_id)
+                && optional_turn_id_matches(notification.turn_id.as_deref(), turn_id)
         }
         ServerNotification::ItemCompleted(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::ItemStarted(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::ModelRerouted(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::ModelVerification(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::ThreadTokenUsageUpdated(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::TurnCompleted(notification) => {
-            notification.thread_id == thread_id && notification.turn.id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn.id.as_str(), turn_id)
         }
         ServerNotification::TurnDiffUpdated(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::TurnPlanUpdated(notification) => {
-            notification.thread_id == thread_id && notification.turn_id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn_id.as_str(), turn_id)
         }
         ServerNotification::TurnStarted(notification) => {
-            notification.thread_id == thread_id && notification.turn.id == turn_id
+            notification.thread_id == thread_id
+                && turn_id_matches(notification.turn.id.as_str(), turn_id)
         }
         _ => false,
     }

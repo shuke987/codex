@@ -105,6 +105,14 @@ fn parses_config_isolation_flags() {
 }
 
 #[test]
+fn parses_goal_flag() {
+    let cli = Cli::parse_from(["codex-exec", "--goal", "finish the migration"]);
+
+    assert!(cli.goal);
+    assert_eq!(cli.prompt.as_deref(), Some("finish the migration"));
+}
+
+#[test]
 fn approve_for_me_flag_applies_to_resume_when_passed_at_exec_root() {
     for flag in ["--approve-for-me", "--not-so-yolo"] {
         let cli = Cli::parse_from(["codex-exec", flag, "resume", "--last"]);

@@ -2,6 +2,25 @@
 
 The workflows in this directory are split so that pull requests get fast, review-friendly signal while `main` still gets the full cross-platform verification pass.
 
+## Independent exec-goal forks
+
+Outside `openai/codex`, `blocking-ci.yml` requires the shared repository,
+spelling, dependency-policy and blob-size checks plus `fork-exec-ci.yml`.
+The fork job runs on standard Linux x64 hardware, builds the full CLI and its
+matching code-mode host, runs all exec and code-mode-host tests, and checks
+formatting, unused dependencies and scoped Clippy. It also runs after pushes
+to `codex/exec-goal`. Its debug build is a CI smoke artifact, not a release.
+
+The upstream full-platform Bazel and Rust workflows remain available through
+manual dispatch. They are not part of the fork's Linux maintenance contract;
+in particular, Windows voice-host builds have additional MSVC runtime license
+and native-toolchain prerequisites. No cross-platform passing result should
+be inferred from the Linux gate. Official repository checks remain unchanged.
+
+The final required check verifies every active dependency. Only the explicitly
+inactive profile may be skipped; a skipped, cancelled or failed Linux test job
+still fails the fork's merge gate.
+
 ## Pull Requests
 
 - Required checks run against GitHub's synthetic merge commit, not the pull

@@ -1,0 +1,73 @@
+name: fork-exec-ci
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  linux-exec:
+    name: CLI, code-mode host and exec regressions (Linux x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+        id: setup_ci
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap lld
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy,rustfmt
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: cargo-nextest@0.9.103,cargo-shear@1.11.2
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+      - name: Restore Cargo cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ steps.setup_ci.outputs.cargo-target-dir }}
+          key: fork-exec-linux-x64-rust-1.95.0-${{ hashFiles('codex-rs/Cargo.lock') }}
+      - name: Check formatting and dependency usage
+        run: |
+          cargo fmt -- --config imports_granularity=Item --check
+          cargo shear --deny-warnings
+          just bench-smoke
+      - name: Build the complete CLI and matching code-mode host
+        run: cargo build --locked -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
+      - name: Verify CLI identity and goal entry point
+        run: |
+          "$CARGO_TARGET_DIR/debug/codex" --version | grep -Fx 'codex-cli 0.156.1'
+          "$CARGO_TARGET_DIR/debug/codex" exec --help | grep -q -- '--goal'
+          test -x "$CARGO_TARGET_DIR/debug/codex-code-mode-host"
+      - name: Run exec and code-mode host regressions
+        run: just test --locked -p codex-exec -p codex-code-mode-host --test-threads 2
+      - name: Lint the modified exec crate
+        run: cargo clippy --locked -p codex-exec --all-targets -- -D warnings
+      - name: Upload test results
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: linux-exec-goal-test-results
+          path: ${{ env.CARGO_TARGET_DIR }}/nextest/local/junit.xml
+          if-no-files-found: warn
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree

@@ -5,13 +5,14 @@ name: blocking-ci
 on:
   pull_request: {}
   push:
-    branches: [main]
+    branches: [main, codex/exec-goal]
 
 jobs:
   # Keep reusable workflow calls alphabetized. The `required` job below is the
   # version-controlled list that the main-branch ruleset should require.
   bazel:
     name: Bazel
+    if: github.repository == 'openai/codex'
     uses: ./.github/workflows/bazel.yml
     secrets: inherit
 
@@ -37,13 +38,20 @@ jobs:
 
   rust-ci:
     name: rust-ci
+    if: github.repository == 'openai/codex'
     uses: ./.github/workflows/rust-ci.yml
     secrets: inherit
 
   sdk:
     name: sdk
+    if: github.repository == 'openai/codex'
     uses: ./.github/workflows/sdk.yml
     secrets: inherit
+
+  fork-exec:
+    name: Linux exec-goal
+    if: github.repository != 'openai/codex'
+    uses: ./.github/workflows/fork-exec-ci.yml
 
   required:
     name: CI required
@@ -58,6 +66,7 @@ jobs:
       - repo-checks
       - rust-ci
       - sdk
+      - fork-exec
     runs-on: ubuntu-24.04
     steps:
       # Keep the helper on the same combined revision as the child workflows so
@@ -69,4 +78,21 @@ jobs:
       - name: Require successful dependencies
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: python3 .github/scripts/check_ci_results.py
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import runpy
+
+          needs = json.loads(os.environ["NEEDS"])
+          expected = {"bazel", "blob-size-policy", "cargo-deny", "codespell", "repo-checks", "rust-ci", "sdk", "fork-exec"}
+          if needs.keys() != expected:
+              raise SystemExit("Incomplete CI dependency results")
+          upstream = os.environ["GITHUB_REPOSITORY"] == "openai/codex"
+          inactive = ["fork-exec"] if upstream else ["bazel", "rust-ci", "sdk"]
+          for name in inactive:
+              if needs.pop(name)["result"] != "skipped":
+                  raise SystemExit(f"Unexpected CI profile result for {name}")
+          os.environ["NEEDS"] = json.dumps(needs)
+          runpy.run_path(".github/scripts/check_ci_results.py", run_name="__main__")
+          PY
