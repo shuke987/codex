@@ -1,3 +1,4 @@
+use codex_app_server_client::InProcessServerEvent;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadGoalStatus;
 
@@ -39,13 +40,23 @@ impl ExecGoalState {
         self.pending_activation.is_some()
     }
 
+    pub(crate) fn check_event(&self, event: Option<&InProcessServerEvent>) -> anyhow::Result<()> {
+        match event {
+            None if self.is_active() => {
+                anyhow::bail!("Goal event stream closed before goal completion");
+            }
+            Some(InProcessServerEvent::Lagged { skipped }) if self.activation_pending() => {
+                anyhow::bail!("Goal activation unconfirmed after losing {skipped} events");
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn update_from_goal(&mut self, goal: &ThreadGoal) {
         if let Some(expected) = &self.pending_activation {
-            // thread/resume can queue a stopped goal snapshot before goal/set
-            // reactivates it. Its RPC response does not drain that event queue.
-            // The server orders the exact goal/set snapshot before applying its
-            // runtime effects, so use that notification as the activation fence.
-            // Timestamps alone are insufficient: they have second precision.
+            // Resume can queue old snapshots before goal/set reactivates the goal.
+            // The server orders this exact snapshot before activation effects;
+            // use it as a fence. Second-precision timestamps alone are insufficient.
             if goal != expected {
                 eprintln!(
                     "Ignoring pre-activation goal snapshot: thread={} status={:?} updated_at={}",
@@ -72,8 +83,7 @@ impl ExecGoalState {
 
     pub(crate) fn clear(&mut self) {
         if self.activation_pending() {
-            // A newly created goal can likewise follow a queued "no goal"
-            // resume snapshot. Real clears are ordered after activation.
+            // Ignore queued "no goal" resume snapshots; real clears follow activation.
             eprintln!("Ignoring pre-activation goal-cleared snapshot");
             return;
         }

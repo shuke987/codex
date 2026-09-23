@@ -1305,6 +1305,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     interrupt_channel_open = false;
                     continue;
                 }
+                // Cancellation must fail even before the first turn notification.
+                error_seen |= goal_state.is_enabled();
                 let Some(turn_id) = current_turn_id.clone() else {
                     if let Err(err) = request_shutdown(
                         &client,
@@ -1337,6 +1339,16 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             maybe_event = client.next_event() => maybe_event,
         };
 
+        if let Err(err) = goal_state.check_event(server_event.as_ref()) {
+            error_seen = true;
+            eprintln!("{err}: thread={primary_thread_id_for_requests}");
+            if let Err(err) =
+                request_shutdown(&client, &mut request_ids, &primary_thread_id_for_requests).await
+            {
+                warn!("thread/unsubscribe failed after goal event stream failure: {err}");
+            }
+            break;
+        }
         let Some(server_event) = server_event else {
             break;
         };
@@ -1423,21 +1435,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 let message = lagged_event_warning_message(skipped);
                 warn!("{message}");
                 event_processor.process_warning(message);
-                if goal_state.activation_pending() {
-                    // The activation snapshot may have been lost. Continuing
-                    // would leave all later goal terminal states behind the fence.
-                    error_seen = true;
-                    eprintln!(
-                        "Goal activation unconfirmed after losing {skipped} events: thread={primary_thread_id_for_requests}"
-                    );
-                    if let Err(err) =
-                        request_shutdown(&client, &mut request_ids, &primary_thread_id_for_requests)
-                            .await
-                    {
-                        warn!("thread/unsubscribe failed after goal activation event loss: {err}");
-                    }
-                    break;
-                }
             }
         }
     }
