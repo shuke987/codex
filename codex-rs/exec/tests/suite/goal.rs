@@ -5,6 +5,7 @@ use core_test_support::responses;
 use core_test_support::test_codex_exec::test_codex_exec;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::time::Duration;
 
 fn tool_is_exposed(body: &Value, tool_name: &str) -> bool {
     let nested_tool_heading = format!("### `{tool_name}`");
@@ -167,4 +168,143 @@ fn goal_flag_rejects_fork_without_creating_a_thread() {
             "`codex exec --goal` cannot be combined with `fork`",
         ));
     assert!(!test.home_path().join("sessions").exists());
+}
+
+fn capacity_response() -> String {
+    responses::sse(vec![serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "id": "capacity-response",
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "Selected model is at capacity. Please try a different model."
+            }
+        }
+    })])
+}
+
+fn json_events(output: &[u8]) -> Vec<Value> {
+    std::str::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_resume_after_capacity_completes_the_same_session() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let server = responses::start_mock_server().await;
+    let resumed_response = responses::sse(vec![
+        responses::ev_response_created("resumed-goal"),
+        responses::ev_function_call(
+            "complete-resumed-goal",
+            "update_goal",
+            r#"{"status":"complete"}"#,
+        ),
+        responses::ev_completed("resumed-goal"),
+    ]);
+    let final_response = responses::sse(vec![
+        responses::ev_response_created("resumed-final"),
+        responses::ev_assistant_message("resumed-message", "review recovered"),
+        responses::ev_completed("resumed-final"),
+    ]);
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![capacity_response(), resumed_response, final_response],
+    )
+    .await;
+
+    let first = test
+        .cmd_with_server(&server)
+        .args([
+            "--skip-git-repo-check",
+            "--json",
+            "--goal",
+            "finish the review",
+        ])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let first_events = json_events(&first.stdout);
+    let thread_id = first_events[0]["thread_id"].as_str().unwrap();
+    assert!(
+        first_events
+            .iter()
+            .any(|event| event["type"] == "turn.failed")
+    );
+
+    let resumed = test
+        .cmd_with_server(&server)
+        .args([
+            "--skip-git-repo-check",
+            "--json",
+            "--goal",
+            "resume",
+            thread_id,
+            "continue the review",
+        ])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let resumed_events = json_events(&resumed.stdout);
+    assert_eq!(resumed_events[0], first_events[0]);
+    assert!(
+        resumed_events
+            .iter()
+            .any(|event| event["type"] == "turn.started")
+    );
+    assert_eq!(resumed_events.last().unwrap()["type"], "turn.completed");
+    assert_eq!(response_mock.requests().len(), 3);
+    assert!(String::from_utf8(resumed.stderr)?.contains("Goal activation observed:"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_resume_reports_a_new_capacity_failure() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let server = responses::start_mock_server().await;
+    let response_mock =
+        responses::mount_sse_sequence(&server, vec![capacity_response(), capacity_response()])
+            .await;
+    let first = test
+        .cmd_with_server(&server)
+        .args([
+            "--skip-git-repo-check",
+            "--json",
+            "--goal",
+            "finish the review",
+        ])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let first_events = json_events(&first.stdout);
+    let thread_id = first_events[0]["thread_id"].as_str().unwrap();
+    let resumed = test
+        .cmd_with_server(&server)
+        .args([
+            "--skip-git-repo-check",
+            "--json",
+            "--goal",
+            "resume",
+            thread_id,
+            "continue the review",
+        ])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let resumed_events = json_events(&resumed.stdout);
+    assert_eq!(resumed_events[0], first_events[0]);
+    assert_eq!(resumed_events.last().unwrap()["type"], "turn.failed");
+    assert_eq!(response_mock.requests().len(), 2);
+    Ok(())
+
 }
