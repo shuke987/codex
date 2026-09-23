@@ -84,3 +84,33 @@ fn only_pre_activation_clear_is_ignored() {
         (false, false)
     );
 }
+
+#[test]
+fn lost_activation_notification_fails_instead_of_waiting_for_a_terminal_snapshot() {
+    let active = active_goal();
+    let mut state = ExecGoalState::activate(active.clone());
+    let lost = InProcessServerEvent::Lagged { skipped: 1 };
+    assert!(state.check_event(Some(&lost)).is_err());
+    let mut terminal = active.clone();
+    terminal.status = ThreadGoalStatus::Complete;
+    state.update_from_goal(&terminal);
+    assert!(state.check_event(Some(&lost)).is_err());
+
+    state.update_from_goal(&active);
+    // Keep the existing policy for best-effort event loss after activation.
+    assert!(state.check_event(Some(&lost)).is_ok());
+}
+
+#[test]
+fn closed_event_stream_fails_until_the_goal_has_stopped() {
+    let active = active_goal();
+    let mut state = ExecGoalState::activate(active.clone());
+    assert!(state.check_event(None).is_err());
+    state.update_from_goal(&active);
+    assert!(state.check_event(None).is_err());
+    let mut terminal = active;
+    terminal.status = ThreadGoalStatus::Complete;
+    state.update_from_goal(&terminal);
+    assert!(state.check_event(None).is_ok());
+    assert!(ExecGoalState::default().check_event(None).is_ok());
+}
