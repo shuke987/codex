@@ -21,6 +21,43 @@ The final required check verifies every active dependency. Only the explicitly
 inactive profile may be skipped; a skipped, cancelled or failed Linux test job
 still fails the fork's merge gate.
 
+## Fork release candidates
+
+`fork-release-candidate.yml` builds a Linux x64 GNU release package on Ubuntu
+24.04 using standard hosted hardware. Run it manually with an optional full,
+lowercase commit SHA in `source_ref`; leaving it empty resolves the current
+`codex/exec-goal` head once at the start. Only commits already on that maintenance
+branch are accepted. The workflow and smoke-test revision are recorded separately
+from the selected source revision. Pull requests changing the workflow or its
+smoke script also exercise the candidate build against the maintenance head.
+
+GitHub requires a workflow-dispatch entrypoint on the default branch. This fork uses
+`codex/exec-goal` as its default, retaining `main` for upstream tracking. The Run
+workflow button becomes available after this workflow is merged there.
+
+```bash
+gh workflow run fork-release-candidate.yml --repo shuke987/codex \
+  --ref codex/exec-goal -f source_ref=<full-maintenance-commit-sha>
+```
+
+The job uses locked Cargo dependencies and checksum-verified V8/resources, builds
+with the release profile (debug information disabled), and assembles the canonical
+CLI package, including the matching code-mode host, bwrap, ripgrep and patched zsh.
+It extracts the final archive, verifies checksums, and runs an isolated local-model
+smoke test: capacity failure, resume of the same thread, packaged ripgrep execution
+through code mode, goal completion and a successful terminal event.
+
+Successful runs upload a 30-day Actions artifact with the `.tar.gz`, `SHA256SUMS`
+and `build-info.json`. Verify the outer checksums before extraction; the package
+also contains a per-file checksum manifest. Build provenance includes source and
+workflow commits, target, compiler, lockfile digest and run URL. Download via the
+run's Artifacts section or `gh run download <run-id> --repo shuke987/codex`.
+
+This is an Ubuntu 24.04 GNU candidate, not a portable musl distribution or a full
+multi-platform/voice release. Real review helper acceptance, live-model tests and
+production installation remain separate. The workflow creates no release/tag and
+has no publishing credentials or OSS upload step.
+
 ## Pull Requests
 
 - Required checks run against GitHub's synthetic merge commit, not the pull
