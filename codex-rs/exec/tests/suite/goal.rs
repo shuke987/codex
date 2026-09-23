@@ -6,38 +6,34 @@ use core_test_support::test_codex_exec::test_codex_exec;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
-fn tool_names(body: &Value) -> Vec<String> {
-    body.get("tools")
-        .and_then(Value::as_array)
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(|tool| {
-                    tool.get("name")
-                        .or_else(|| tool.get("type"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn tool_is_exposed(body: &Value, tool_name: &str) -> bool {
-    if tool_names(body).iter().any(|name| name == tool_name) {
-        return true;
-    }
-
     let nested_tool_heading = format!("### `{tool_name}`");
-    body.get("input")
+    let additional_tools = body
+        .get("input")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"));
+
+    std::iter::once(body)
+        .chain(additional_tools)
         .filter_map(|item| item.get("tools").and_then(Value::as_array))
         .flatten()
-        .filter_map(|tool| tool.get("description").and_then(Value::as_str))
-        .any(|description| description.contains(&nested_tool_heading))
+        .flat_map(|tool| {
+            std::iter::once(tool).chain(
+                tool.get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            )
+        })
+        .any(|tool| {
+            tool.get("name").and_then(Value::as_str) == Some(tool_name)
+                || tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .is_some_and(|description| description.contains(&nested_tool_heading))
+        })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
