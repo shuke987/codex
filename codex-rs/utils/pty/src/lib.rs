@@ -1,9 +1,19 @@
+mod child;
+pub use child::Child;
+mod child_command;
+pub use child_command::ChildStdin;
+pub use child_command::Command;
+pub use child_command::DescriptorPolicy;
+pub use child_command::ProcessMode;
+pub use child_command::SpawnFallback;
 pub mod pipe;
 mod process;
 pub mod process_group;
 pub mod pty;
 #[cfg(test)]
 mod tests;
+#[cfg(unix)]
+mod unix_io;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -37,6 +47,8 @@ pub type SpawnedPty = SpawnedProcess;
 pub use pty::conpty_supported;
 /// Spawn a process attached to a PTY for interactive use.
 pub use pty::spawn_process as spawn_pty_process;
+#[cfg(windows)]
+pub use win::JobObject;
 #[cfg(windows)]
 pub use win::PsuedoCon;
 #[cfg(windows)]

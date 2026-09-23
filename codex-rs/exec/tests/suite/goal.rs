@@ -89,3 +89,86 @@ async fn goal_flag_starts_goal_mode_and_waits_for_completion() -> anyhow::Result
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_flag_waits_across_automatic_continuation_turns() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-progress"),
+                responses::ev_assistant_message("msg-progress", "More work remains."),
+                responses::ev_completed("resp-progress"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-complete"),
+                responses::ev_function_call(
+                    "complete-goal",
+                    "update_goal",
+                    r#"{"status":"complete"}"#,
+                ),
+                responses::ev_completed("resp-complete"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-final"),
+                responses::ev_assistant_message("msg-final", "goal complete"),
+                responses::ev_completed("resp-final"),
+            ]),
+        ],
+    )
+    .await;
+
+    let assert = test
+        .cmd_with_server(&server)
+        .args([
+            "--skip-git-repo-check",
+            "--goal",
+            "--json",
+            "finish the multi-turn task",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let events: Vec<Value> = String::from_utf8_lossy(&assert.get_output().stdout)
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let event_types: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .filter(|kind| kind.starts_with("turn."))
+        .collect();
+    assert_eq!(
+        event_types,
+        vec![
+            "turn.started",
+            "turn.completed",
+            "turn.started",
+            "turn.completed"
+        ]
+    );
+    assert_eq!(response_mock.requests().len(), 3);
+    Ok(())
+}
+
+#[test]
+fn goal_flag_rejects_fork_without_creating_a_thread() {
+    let test = test_codex_exec();
+    test.cmd()
+        .args([
+            "--skip-git-repo-check",
+            "--goal",
+            "fork",
+            "missing-thread",
+            "finish the task",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "`codex exec --goal` cannot be combined with `fork`",
+        ));
+    assert!(!test.home_path().join("sessions").exists());
+}

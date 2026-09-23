@@ -7,12 +7,16 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ListMcpServerStatusParams;
+use codex_app_server_protocol::ListMcpServerStatusResponse;
 use codex_app_server_protocol::McpServerStartupState;
+use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
@@ -39,13 +43,16 @@ use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::TrustLevel;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::openai_models::ReasoningEffort;
+use core_test_support::stdio_server_bin;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -79,19 +86,12 @@ async fn start_thread_with_model(
     model: &str,
     allow_provider_model_fallback: bool,
 ) -> Result<ThreadStartResponse> {
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some(model.to_string()),
-            allow_provider_model_fallback,
-            ..Default::default()
-        })
-        .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    to_response(response)
+    mcp.start_thread(ThreadStartParams {
+        model: Some(model.to_string()),
+        allow_provider_model_fallback,
+        ..Default::default()
+    })
+    .await
 }
 
 #[tokio::test]
@@ -105,22 +105,15 @@ model = "gpt-5.4-mini"
     )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let response = mcp
+        .start_thread(ThreadStartParams {
             allow_provider_model_fallback: true,
             ..Default::default()
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: ThreadStartResponse = to_response(response)?;
 
     assert_eq!(response.model, "openai.gpt-5.6-sol");
     Ok(())
@@ -131,9 +124,8 @@ async fn thread_start_warns_for_exec_policy_parse_failure_after_initialize() -> 
     let codex_home = TempDir::new()?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let rules_dir = codex_home.path().join("rules");
     std::fs::create_dir_all(&rules_dir)?;
@@ -141,15 +133,7 @@ async fn thread_start_warns_for_exec_policy_parse_failure_after_initialize() -> 
     std::fs::write(&rules_path, "prefix_rule(")?;
     let rules_path = std::fs::canonicalize(rules_path)?;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let _: ThreadStartResponse = to_response(response)?;
+    mcp.start_thread(ThreadStartParams::default()).await?;
 
     let notification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -212,9 +196,8 @@ async fn thread_start_does_not_repeat_initialize_exec_policy_warning() -> Result
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_matching_notification(
@@ -224,15 +207,7 @@ async fn thread_start_does_not_repeat_initialize_exec_policy_warning() -> Result
     )
     .await??;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let response = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let _: ThreadStartResponse = to_response(response)?;
+    mcp.start_thread(ThreadStartParams::default()).await?;
 
     let duplicate_warning = timeout(
         std::time::Duration::from_millis(250),
@@ -260,9 +235,8 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
     )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let unsupported_with_fallback = start_thread_with_model(
         &mut mcp,
@@ -295,15 +269,45 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
 }
 
 #[tokio::test]
+async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"model_provider = "amazon-bedrock-runtime"
+"#,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    for model in ["global.openai.gpt-5.6-sol", "us.openai.gpt-5.6-sol"] {
+        let response =
+            start_thread_with_model(&mut mcp, model, /*allow_provider_model_fallback*/ true)
+                .await?;
+        assert_eq!(response.model, model);
+    }
+
+    let response = start_thread_with_model(
+        &mut mcp,
+        "openai.gpt-5.6-sol",
+        /*allow_provider_model_fallback*/ true,
+    )
+    .await?;
+    assert_eq!(response.model, "global.openai.gpt-5.6-sol");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_provider_model_fallback_ignores_dynamic_catalog() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let response = start_thread_with_model(
         &mut mcp,
@@ -322,20 +326,25 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "sandbox_mode = \"read-only\"\nmodel_reasoning_effort = \"high\"",
+        "",
+    )?;
 
     // Start server and initialize.
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     // Start a v2 thread with an explicit model override.
     let req_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2".to_string()),
             thread_source: Some(ThreadSource::User),
+            service_name: Some("codex_work_desktop".to_string()),
             ..Default::default()
         })
         .await?;
@@ -362,6 +371,10 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         "new threads should start with an empty preview"
     );
     assert_eq!(model_provider, "mock_provider");
+    assert_eq!(
+        (thread.model.as_deref(), thread.reasoning_effort.clone()),
+        (Some("gpt-5.2"), Some(ReasoningEffort::High))
+    );
     assert!(
         thread.created_at > 0,
         "created_at should be a positive UNIX timestamp"
@@ -372,6 +385,7 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     );
     assert_eq!(thread.status, ThreadStatus::Idle);
     assert_eq!(thread.thread_source, Some(ThreadSource::User));
+    assert_eq!(thread.originator.as_deref(), Some("codex_work_desktop"));
     let thread_path = thread.path.clone().expect("thread path should be present");
     assert!(thread_path.is_absolute(), "thread path should be absolute");
     assert!(
@@ -406,8 +420,8 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     );
     assert_eq!(
         thread_json.get("historyMode").and_then(Value::as_str),
-        Some("legacy"),
-        "new threads should serialize `historyMode: legacy`"
+        Some("paginated"),
+        "durable threads should default to `historyMode: paginated` when supported"
     );
     assert_eq!(
         thread_json.get("threadSource").and_then(Value::as_str),
@@ -470,49 +484,33 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_start_history_mode_accepts_legacy_and_rejects_paginated() -> Result<()> {
+async fn thread_start_history_mode_accepts_legacy_and_paginated() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
             history_mode: Some(ThreadHistoryMode::Legacy),
             ..Default::default()
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response(response)?;
 
     assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
             history_mode: Some(ThreadHistoryMode::Paginated),
             ..Default::default()
         })
         .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
 
-    assert_eq!(error.error.code, -32601);
-    assert_eq!(
-        error.error.message,
-        "paginated_threads is not supported yet"
-    );
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
     Ok(())
 }
 
@@ -529,9 +527,8 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -542,17 +539,12 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
     let ThreadStartResponse {
         cwd: response_cwd,
         runtime_workspace_roots,
         sandbox,
         ..
-    } = to_response::<ThreadStartResponse>(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(req_id)).await??;
 
     assert_eq!(response_cwd, cwd.abs());
     assert_eq!(runtime_workspace_roots, vec![extra_root.abs()]);
@@ -581,16 +573,11 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
     let ThreadStartResponse {
         runtime_workspace_roots,
         sandbox,
         ..
-    } = to_response::<ThreadStartResponse>(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(req_id)).await??;
     assert_eq!(runtime_workspace_roots, vec![environment_root.abs()]);
     #[cfg(windows)]
     let _ = sandbox;
@@ -623,9 +610,8 @@ async fn thread_start_excludes_profile_workspace_roots_from_runtime_workspace_ro
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -634,15 +620,10 @@ async fn thread_start_excludes_profile_workspace_roots_from_runtime_workspace_ro
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
     let ThreadStartResponse {
         runtime_workspace_roots,
         ..
-    } = to_response::<ThreadStartResponse>(resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(req_id)).await??;
 
     assert_eq!(
         runtime_workspace_roots,
@@ -665,9 +646,8 @@ async fn thread_start_rejects_unknown_environment_as_invalid_request() -> Result
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -704,9 +684,8 @@ async fn thread_start_rejects_relative_environment_cwd_as_invalid_request() -> R
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     let environment_id = mcp.auto_env_params()?.environment_id;
 
     let request_id = mcp
@@ -738,6 +717,44 @@ async fn thread_start_rejects_relative_environment_cwd_as_invalid_request() -> R
 }
 
 #[tokio::test]
+async fn thread_start_rejects_oversized_environment_cwd_as_invalid_request() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let environment_id = mcp.auto_env_params()?.environment_id;
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            environments: Some(vec![TurnEnvironmentParams {
+                environment_id,
+                cwd: serde_json::from_value(json!(format!("C:\\{}", "x".repeat(9_000))))?,
+                runtime_workspace_roots: None,
+            }]),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(error.id, RequestId::Integer(request_id));
+    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(
+        error.error.message,
+        "turn environment working directory exceeds the maximum size"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_response_includes_loaded_instruction_sources() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -752,9 +769,8 @@ async fn thread_start_response_includes_loaded_instruction_sources() -> Result<(
         .with_codex_home(codex_home.path())
         // TODO(anp): Move the instruction-source fixture into the auto environment cwd.
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -762,15 +778,10 @@ async fn thread_start_response_includes_loaded_instruction_sources() -> Result<(
             ..Default::default()
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ThreadStartResponse {
         instruction_sources,
         ..
-    } = to_response::<ThreadStartResponse>(response)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let instruction_sources = instruction_sources
         .into_iter()
@@ -804,9 +815,8 @@ async fn thread_start_response_excludes_empty_project_instruction_source() -> Re
         .with_codex_home(codex_home.path())
         // TODO(anp): Move the instruction-source fixture into the auto environment cwd.
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -814,15 +824,10 @@ async fn thread_start_response_excludes_empty_project_instruction_source() -> Re
             ..Default::default()
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ThreadStartResponse {
         instruction_sources,
         ..
-    } = to_response::<ThreadStartResponse>(response)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let instruction_sources = instruction_sources
         .into_iter()
@@ -850,9 +855,8 @@ async fn thread_start_without_selected_environment_includes_only_global_instruct
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -861,16 +865,11 @@ async fn thread_start_without_selected_environment_includes_only_global_instruct
             ..Default::default()
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
     let ThreadStartResponse {
         thread,
         instruction_sources,
         ..
-    } = to_response::<ThreadStartResponse>(response)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     assert_eq!(
         instruction_sources
@@ -944,23 +943,16 @@ async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_managed_config()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
             thread_source: Some(ThreadSource::User),
             service_name: Some("codex_work_desktop".to_string()),
             ..Default::default()
         })
         .await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
 
     let payload = wait_for_analytics_payload(&server, DEFAULT_READ_TIMEOUT).await?;
     assert_eq!(payload["events"].as_array().expect("events array").len(), 1);
@@ -997,25 +989,17 @@ model_reasoning_effort = "high"
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse {
+        reasoning_effort, ..
+    } = mcp
+        .start_thread(ThreadStartParams {
             cwd: Some(workspace.path().to_string_lossy().into_owned()),
             ..Default::default()
         })
         .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse {
-        reasoning_effort, ..
-    } = to_response::<ThreadStartResponse>(resp)?;
 
     assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
     Ok(())
@@ -1030,24 +1014,16 @@ async fn thread_start_drops_unsupported_service_tier_id() -> Result<()> {
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let service_tier_id = "experimental-tier-id".to_string();
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse { service_tier, .. } = mcp
+        .start_thread(ThreadStartParams {
             service_tier: Some(Some(service_tier_id.clone())),
             ..Default::default()
         })
         .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { service_tier, .. } = to_response::<ThreadStartResponse>(resp)?;
 
     // Unsupported catalog ids are dropped at session config time instead of echoed back.
     assert_eq!(service_tier, None);
@@ -1063,23 +1039,15 @@ async fn thread_start_accepts_default_service_tier() -> Result<()> {
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse { service_tier, .. } = mcp
+        .start_thread(ThreadStartParams {
             service_tier: Some(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
             ..Default::default()
         })
         .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { service_tier, .. } = to_response::<ThreadStartResponse>(resp)?;
 
     assert_eq!(
         service_tier,
@@ -1097,23 +1065,15 @@ async fn thread_start_accepts_metrics_service_name() -> Result<()> {
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
             service_name: Some("my_app_server_client".to_string()),
             ..Default::default()
         })
         .await?;
-
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
     assert!(!thread.id.is_empty(), "thread id should not be empty");
 
     Ok(())
@@ -1127,9 +1087,8 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let req_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
@@ -1150,6 +1109,7 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
         thread.ephemeral,
         "ephemeral threads should be marked explicitly"
     );
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
     assert_eq!(
         thread.path, None,
         "ephemeral threads should not expose a path"
@@ -1176,9 +1136,8 @@ async fn thread_start_fails_when_required_mcp_server_fails_to_initialize() -> Re
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let req_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams::default())
@@ -1207,6 +1166,117 @@ async fn thread_start_fails_when_required_mcp_server_fails_to_initialize() -> Re
 }
 
 #[tokio::test]
+async fn thread_start_fails_when_managed_hook_matcher_is_invalid() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        r#"[hooks]
+
+[[hooks.PreToolUse]]
+matcher = "["
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo managed"
+"#,
+    )?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let request_id = app_server
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert!(
+        error.error.message.contains("managed") && error.error.message.contains("invalid matcher"),
+        "unexpected error message: {}",
+        error.error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_fails_when_managed_hook_handler_is_unsupported() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        r#"[hooks]
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "prompt"
+"#,
+    )?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let request_id = app_server
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert!(
+        error.error.message.contains("prompt hook"),
+        "unexpected error message: {}",
+        error.error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_succeeds_when_managed_mcp_hook_is_supported() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        r#"[hooks]
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "mcp_tool"
+server = "security"
+tool = "scan"
+"#,
+    )?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let response = app_server
+        .start_thread(ThreadStartParams::default())
+        .await?;
+
+    assert!(!response.thread.id.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_emits_mcp_server_status_updated_notifications() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -1215,21 +1285,10 @@ async fn thread_start_emits_mcp_server_status_updated_notifications() -> Result<
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .build_initialized()
         .await?;
 
-    let start_response: ThreadStartResponse = to_response(
-        timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
-        )
-        .await??,
-    )?;
+    let start_response = mcp.start_thread(ThreadStartParams::default()).await?;
 
     let starting = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1334,9 +1393,8 @@ async fn thread_start_does_not_wait_for_optional_http_mcp_auth_discovery() -> Re
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let req_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams::default())
@@ -1359,8 +1417,12 @@ async fn thread_start_does_not_wait_for_optional_http_mcp_auth_discovery() -> Re
     Ok(())
 }
 
+#[test_case("thread/start"; "thread_start")]
+#[test_case("model/list"; "model_list")]
 #[tokio::test]
-async fn thread_start_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
+async fn config_requests_surface_cloud_config_bundle_load_errors(
+    request_method: &str,
+) -> Result<()> {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/backend-api/wham/config/bundle"))
@@ -1408,13 +1470,16 @@ async fn thread_start_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
                 Some(refresh_token_url.as_str()),
             ),
         ])
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let req_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
+    let req_id = if request_method == "thread/start" {
+        mcp.send_thread_start_request_with_auto_env(ThreadStartParams::default())
+            .await?
+    } else {
+        mcp.send_raw_request(request_method, Some(json!({})))
+            .await?
+    };
 
     let err: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1442,7 +1507,7 @@ async fn thread_start_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_start_with_elevated_sandbox_trusts_project_and_followup_loads_project_config()
+async fn thread_start_workspace_write_respects_effective_permissions_for_project_trust()
 -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -1461,57 +1526,134 @@ model_reasoning_effort = "high"
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let config_before = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
 
-    let first_request = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let first_response = mcp
+        .start_thread(ThreadStartParams {
             cwd: Some(workspace.path().display().to_string()),
             sandbox: Some(SandboxMode::WorkspaceWrite),
             ..Default::default()
         })
         .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(first_request)),
-    )
-    .await??;
 
-    let second_request = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            cwd: Some(workspace.path().display().to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let second_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(second_request)),
-    )
-    .await??;
     let ThreadStartResponse {
         approval_policy,
         reasoning_effort,
         ..
-    } = to_response::<ThreadStartResponse>(second_response)?;
-
-    assert_eq!(approval_policy, AskForApproval::OnRequest);
-    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+    } = mcp
+        .start_thread(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            ..Default::default()
+        })
+        .await?;
 
     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    let workspace_abs = workspace.path().to_path_buf().abs();
-    let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &workspace_abs)
-        .await
-        .unwrap_or(workspace_abs);
-    let trusted_root_key = project_trust_key(trusted_root.as_path());
-    assert!(config_toml.contains(&trusted_root_key));
-    assert!(config_toml.contains("trust_level = \"trusted\""));
+    if cfg!(windows) {
+        assert_eq!(
+            first_response.sandbox,
+            codex_app_server_protocol::SandboxPolicy::ReadOnly {
+                network_access: false,
+            }
+        );
+        assert_eq!(reasoning_effort, None);
+        assert_eq!(config_toml, config_before);
+    } else {
+        assert_eq!(approval_policy, AskForApproval::OnRequest);
+        assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+        let workspace_abs = workspace.path().to_path_buf().abs();
+        let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &workspace_abs)
+            .await
+            .unwrap_or(workspace_abs);
+        let trusted_root_key = project_trust_key(trusted_root.as_path());
+        assert!(config_toml.contains(&trusted_root_key));
+        assert!(config_toml.contains("trust_level = \"trusted\""));
+    }
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_start_with_nested_git_cwd_trusts_repo_root() -> Result<()> {
+async fn thread_start_with_managed_read_only_does_not_trust_or_load_project_mcp() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    std::fs::write(
+        codex_home.path().join("managed_config.toml"),
+        r#"sandbox_mode = "read-only""#,
+    )?;
+
+    let workspace = TempDir::new()?;
+    std::fs::create_dir(workspace.path().join(".git"))?;
+    let project_config_dir = workspace.path().join(".codex");
+    std::fs::create_dir(&project_config_dir)?;
+    std::fs::write(
+        project_config_dir.join("config.toml"),
+        format!(
+            r#"[mcp_servers.project-server]
+command = {}
+required = true
+"#,
+            toml::Value::String(stdio_server_bin()?),
+        ),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let config_before = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string()),
+            environments: Some(Vec::new()),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse {
+        thread, sandbox, ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        sandbox,
+        codex_app_server_protocol::SandboxPolicy::ReadOnly {
+            network_access: false,
+        }
+    );
+    assert_eq!(
+        std::fs::read_to_string(codex_home.path().join("config.toml"))?,
+        config_before
+    );
+    let mcp_status: ListMcpServerStatusResponse = mcp
+        .request(|request_id| ClientRequest::McpServerStatusList {
+            request_id,
+            params: ListMcpServerStatusParams {
+                cursor: None,
+                limit: None,
+                detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                thread_id: Some(thread.id),
+            },
+        })
+        .await?;
+    assert_eq!(
+        mcp_status,
+        ListMcpServerStatusResponse {
+            data: Vec::new(),
+            next_cursor: None,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_with_nested_git_cwd_respects_effective_permissions_for_project_trust()
+-> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
@@ -1519,38 +1661,88 @@ async fn thread_start_with_nested_git_cwd_trusts_repo_root() -> Result<()> {
 
     let repo_root = TempDir::new()?;
     std::fs::create_dir(repo_root.path().join(".git"))?;
+    std::fs::write(repo_root.path().join(".git/HEAD"), "ref: refs/heads/main\n")?;
     let nested = repo_root.path().join("nested/project");
-    std::fs::create_dir_all(&nested)?;
+    std::fs::create_dir_all(nested.join(".git"))?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let config_before = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse { sandbox, .. } = mcp
+        .start_thread(ThreadStartParams {
             cwd: Some(nested.display().to_string()),
             sandbox: Some(SandboxMode::WorkspaceWrite),
             ..Default::default()
         })
         .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
 
     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-    let nested_abs = nested.abs();
-    let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &nested_abs)
-        .await
-        .expect("git root should resolve");
-    let trusted_root_key = project_trust_key(trusted_root.as_path());
-    let nested_key = project_trust_key(&nested);
-    assert!(config_toml.contains(&trusted_root_key));
-    assert!(!config_toml.contains(&nested_key));
+    if cfg!(windows) {
+        assert_eq!(
+            sandbox,
+            codex_app_server_protocol::SandboxPolicy::ReadOnly {
+                network_access: false,
+            }
+        );
+        assert_eq!(config_toml, config_before);
+    } else {
+        let nested_abs = nested.abs();
+        let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &nested_abs)
+            .await
+            .expect("git root should resolve");
+        let trusted_root_key = project_trust_key(trusted_root.as_path());
+        let nested_key = project_trust_key(&nested);
+        assert!(config_toml.contains(&trusted_root_key));
+        assert!(!config_toml.contains(&nested_key));
+    }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_projectless_does_not_preapprove_later_project_config() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let workspace = TempDir::new()?;
+    let config_path = codex_home.path().join("config.toml");
+    let config_before = std::fs::read_to_string(&config_path)?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let response = mcp
+        .start_thread(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            sandbox: Some(SandboxMode::DangerFullAccess),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        response.sandbox,
+        codex_app_server_protocol::SandboxPolicy::DangerFullAccess
+    );
+    assert_eq!(std::fs::read_to_string(&config_path)?, config_before);
+
+    let project_config_dir = workspace.path().join(".codex");
+    std::fs::create_dir(&project_config_dir)?;
+    std::fs::write(
+        project_config_dir.join("config.toml"),
+        "model_reasoning_effort = \"high\"\n",
+    )?;
+    let response = mcp
+        .start_thread(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            sandbox: Some(SandboxMode::ReadOnly),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(response.reasoning_effort, None);
+    assert_eq!(std::fs::read_to_string(&config_path)?, config_before);
     Ok(())
 }
 
@@ -1562,24 +1754,18 @@ async fn thread_start_with_read_only_sandbox_does_not_persist_project_trust() ->
     create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
 
     let workspace = TempDir::new()?;
+    std::fs::create_dir(workspace.path().join(".codex"))?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            cwd: Some(workspace.path().display().to_string()),
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    mcp.start_thread(ThreadStartParams {
+        cwd: Some(workspace.path().display().to_string()),
+        ..Default::default()
+    })
+    .await?;
 
     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     assert!(!config_toml.contains("trust_level = \"trusted\""));
@@ -1596,6 +1782,7 @@ async fn thread_start_preserves_untrusted_project_trust() -> Result<()> {
     create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
 
     let workspace = TempDir::new()?;
+    std::fs::create_dir(workspace.path().join(".codex"))?;
     let config_path = codex_home.path().join("config.toml");
     let workspace_key = workspace.path().display().to_string();
     let mut config_toml =
@@ -1606,22 +1793,15 @@ async fn thread_start_preserves_untrusted_project_trust() -> Result<()> {
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            cwd: Some(workspace.path().display().to_string()),
-            sandbox: Some(SandboxMode::WorkspaceWrite),
-            ..Default::default()
-        })
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    mcp.start_thread(ThreadStartParams {
+        cwd: Some(workspace.path().display().to_string()),
+        sandbox: Some(SandboxMode::WorkspaceWrite),
+        ..Default::default()
+    })
+    .await?;
 
     let config_after = std::fs::read_to_string(&config_path)?;
     assert_eq!(config_after, config_before);
@@ -1650,27 +1830,20 @@ model_reasoning_effort = "high"
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let ThreadStartResponse {
+        approval_policy,
+        reasoning_effort,
+        ..
+    } = mcp
+        .start_thread(ThreadStartParams {
             cwd: Some(workspace.path().display().to_string()),
             sandbox: Some(SandboxMode::WorkspaceWrite),
             ..Default::default()
         })
         .await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let ThreadStartResponse {
-        approval_policy,
-        reasoning_effort,
-        ..
-    } = to_response::<ThreadStartResponse>(response)?;
 
     assert_eq!(approval_policy, AskForApproval::OnRequest);
     assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
@@ -1685,26 +1858,21 @@ fn create_config_toml_without_approval_policy(
     codex_home: &Path,
     server_uri: &str,
 ) -> std::io::Result<()> {
-    create_config_toml_with_optional_approval_policy(
-        codex_home, server_uri, /*approval_policy*/ None,
-    )
+    create_config_toml(codex_home, server_uri, "sandbox_mode = \"read-only\"", "")
 }
 
-fn create_config_toml_with_optional_approval_policy(
+fn create_config_toml(
     codex_home: &Path,
     server_uri: &str,
-    approval_policy: Option<&str>,
+    top_level_config: &str,
+    additional_tables: &str,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    let approval_policy = approval_policy
-        .map(|policy| format!("approval_policy = \"{policy}\"\n"))
-        .unwrap_or_default();
     std::fs::write(
-        config_toml,
+        codex_home.join("config.toml"),
         format!(
             r#"
 model = "mock-model"
-{approval_policy}sandbox_mode = "read-only"
+{top_level_config}
 
 model_provider = "mock_provider"
 
@@ -1714,6 +1882,7 @@ base_url = "{server_uri}/v1"
 wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
+{additional_tables}
 "#
         ),
     )
@@ -1724,29 +1893,24 @@ fn create_config_toml_with_profile_workspace_root(
     server_uri: &str,
     profile_root: &Path,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
     let profile_root_key = profile_root
         .display()
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    std::fs::write(
-        config_toml,
-        format!(
+    create_config_toml(
+        codex_home,
+        server_uri,
+        "default_permissions = \"dev\"",
+        &format!(
             r#"
-model = "mock-model"
-default_permissions = "dev"
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-
 [permissions.dev.workspace_roots]
 "{profile_root_key}" = true
+
+# This test only exercises workspace roots; Windows restricted-token sandboxes
+# cannot enforce a filesystem policy without root read access.
+[permissions.dev.filesystem]
+":root" = "read"
 
 [permissions.dev.filesystem.":workspace_roots"]
 "." = "write"
@@ -1760,26 +1924,13 @@ fn create_config_toml_with_chatgpt_base_url(
     server_uri: &str,
     chatgpt_base_url: &str,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-chatgpt_base_url = "{chatgpt_base_url}"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
+    create_config_toml(
+        codex_home,
+        server_uri,
+        &format!(
+            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\nchatgpt_base_url = \"{chatgpt_base_url}\""
         ),
+        "",
     )
 }
 
@@ -1787,24 +1938,12 @@ fn create_config_toml_with_required_broken_mcp(
     codex_home: &Path,
     server_uri: &str,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
+    create_config_toml(
+        codex_home,
+        server_uri,
+        "approval_policy = \"never\"\nsandbox_mode = \"read-only\"",
+        &format!(
             r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-
 [mcp_servers.required_broken]
 {required_broken_transport}
 required = true
@@ -1818,24 +1957,12 @@ fn create_config_toml_with_optional_broken_mcp(
     codex_home: &Path,
     server_uri: &str,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
+    create_config_toml(
+        codex_home,
+        server_uri,
+        "approval_policy = \"never\"\nsandbox_mode = \"read-only\"",
+        &format!(
             r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-
 [mcp_servers.optional_broken]
 {optional_broken_transport}
 "#,
@@ -1849,28 +1976,16 @@ fn create_config_toml_with_optional_http_mcp(
     server_uri: &str,
     mcp_uri: &str,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
+    create_config_toml(
+        codex_home,
+        server_uri,
+        "approval_policy = \"never\"\nsandbox_mode = \"read-only\"",
+        &format!(
             r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-
 [mcp_servers.optional_http]
 url = "{mcp_uri}"
 startup_timeout_sec = 60
-"#
+"#,
         ),
     )
 }
