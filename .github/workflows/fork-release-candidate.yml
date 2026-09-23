@@ -1,0 +1,163 @@
+name: fork-release-candidate
+run-name: Linux x64 release candidate (${{ inputs.source_ref || 'maintenance branch head' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Full commit SHA on codex/exec-goal; empty uses its current head"
+        type: string
+        required: false
+  pull_request:
+    branches: [codex/exec-goal]
+    paths:
+      - .github/workflows/fork-release-candidate.yml
+      - .github/scripts/smoke-fork-release.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-candidate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x64:
+    if: github.repository == 'shuke987/codex'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve immutable source revision
+        id: source
+        env:
+          REQUESTED_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          cp .github/scripts/smoke-fork-release.py "$RUNNER_TEMP/smoke-fork-release.py"
+          git fetch --no-tags origin codex/exec-goal:refs/remotes/origin/codex/exec-goal
+          source_sha="$(git rev-parse refs/remotes/origin/codex/exec-goal)"
+          if [[ -n "$REQUESTED_REF" ]]; then
+            [[ "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_ref must be a full lowercase commit SHA'; exit 1; }
+            git cat-file -e "${REQUESTED_REF}^{commit}"
+            git merge-base --is-ancestor "$REQUESTED_REF" refs/remotes/origin/codex/exec-goal
+            source_sha="$REQUESTED_REF"
+          fi
+          git checkout --detach "$source_sha"
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
+          echo "Building reviewed maintenance commit $source_sha" >> "$GITHUB_STEP_SUMMARY"
+      - uses: ./.github/actions/setup-ci
+        id: setup_ci
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev bubblewrap lld
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.3"
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ steps.setup_ci.outputs.cargo-target-dir }}
+          key: fork-release-gnu-x64-rust195-debug0-v1-${{ hashFiles('codex-rs/Cargo.lock') }}
+      - name: Build release CLI, host and sandbox helper
+        working-directory: codex-rs
+        run: |
+          cargo build --locked --release --target "$TARGET" \
+            -p codex-cli --bin codex \
+            -p codex-code-mode-host --bin codex-code-mode-host \
+            -p codex-bwrap --bin bwrap
+      - name: Assemble canonical package and provenance
+        id: package
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/codex-package"
+          binaries="$CARGO_TARGET_DIR/$TARGET/release"
+          just assemble-codex-package --target "$TARGET" --package-dir "$package" \
+            --entrypoint-bin "$binaries/codex" \
+            --code-mode-host-bin "$binaries/codex-code-mode-host" \
+            --bwrap-bin "$binaries/bwrap"
+          export PACKAGE_DIR="$package"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import subprocess
+          from pathlib import Path
+
+          package = Path(os.environ["PACKAGE_DIR"])
+          info = {
+              "source_repository": os.environ["GITHUB_REPOSITORY"],
+              "source_commit": os.environ["SOURCE_SHA"],
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "run_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "target": os.environ["TARGET"],
+              "cargo_profile": "release",
+              "release_debug": "0",
+              "rustflags": os.environ["RUSTFLAGS"],
+              "rustc": subprocess.check_output(["rustc", "-Vv"], text=True).strip(),
+              "build_libc": platform.libc_ver(),
+              "cargo_lock_sha256": hashlib.sha256(Path("codex-rs/Cargo.lock").read_bytes()).hexdigest(),
+          }
+          (package / "build-info.json").write_text(json.dumps(info, indent=2) + "\n")
+          version = json.loads((package / "codex-package.json").read_text())["version"]
+          name = f"codex-exec-goal-{version}-{info['source_commit'][:12]}-{info['target']}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"name={name}\n")
+          PY
+          (cd "$package" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - name: Archive and extract into a fresh smoke-test directory
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-output" "$RUNNER_TEMP/release-smoke"
+          tar -czf "$RUNNER_TEMP/release-output/$PACKAGE_NAME.tar.gz" -C "$RUNNER_TEMP/codex-package" .
+          cp "$RUNNER_TEMP/codex-package/build-info.json" "$RUNNER_TEMP/release-output/"
+          (cd "$RUNNER_TEMP/release-output" && sha256sum "$PACKAGE_NAME.tar.gz" build-info.json > SHA256SUMS)
+          tar -xzf "$RUNNER_TEMP/release-output/$PACKAGE_NAME.tar.gz" -C "$RUNNER_TEMP/release-smoke"
+          (cd "$RUNNER_TEMP/release-smoke" && sha256sum --check SHA256SUMS)
+      - name: Smoke test the shipped CLI, code-mode host and goal recovery
+        timeout-minutes: 10
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/sdk/python/src:$GITHUB_WORKSPACE/sdk/python/tests"
+          uv run --locked --project scripts/codex_package/smoke_tests \
+            python "$RUNNER_TEMP/smoke-fork-release.py" "$RUNNER_TEMP/release-smoke"
+      - uses: ./.github/actions/check-clean-worktree
+      - name: Upload verified candidate package
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ steps.package.outputs.name }}-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-output/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Describe candidate scope
+        run: |
+          {
+            echo '## Verified Linux x64 candidate'
+            echo "Source commit: $SOURCE_SHA"
+            echo 'Download the artifact from this run and verify SHA256SUMS before extracting.'
+            echo 'Built on Ubuntu 24.04 (GNU libc); compatibility with older Linux systems is not implied.'
+            echo 'Includes CLI, code-mode host, bwrap, ripgrep and the supported patched zsh resource.'
+            echo 'Candidate only: no GitHub Release, tag, OSS upload or production replacement.'
+          } >> "$GITHUB_STEP_SUMMARY"
