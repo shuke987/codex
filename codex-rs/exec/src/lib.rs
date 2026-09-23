@@ -9,6 +9,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub(crate) mod event_processor_with_jsonl_output;
 pub(crate) mod exec_events;
+mod goal_state;
 
 pub use cli::Cli;
 pub use cli::Command;
@@ -162,6 +163,7 @@ use uuid::Uuid;
 
 use crate::cli::Command as ExecCommand;
 use crate::event_processor::EventProcessor;
+use crate::goal_state::ExecGoalState;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 const EXEC_DEFAULT_LOG_FILTER: &str = "error,opentelemetry_sdk=off,opentelemetry_otlp=off";
@@ -177,34 +179,6 @@ enum InitialOperation {
     Review {
         review_request: ReviewRequest,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecGoalState {
-    Disabled,
-    Active,
-    Terminal,
-}
-
-impl ExecGoalState {
-    fn is_active(self) -> bool {
-        matches!(self, Self::Active)
-    }
-
-    fn is_enabled(self) -> bool {
-        !matches!(self, Self::Disabled)
-    }
-
-    fn update_from_status(&mut self, status: ThreadGoalStatus) {
-        *self = match status {
-            ThreadGoalStatus::Active => Self::Active,
-            ThreadGoalStatus::Paused
-            | ThreadGoalStatus::Blocked
-            | ThreadGoalStatus::UsageLimited
-            | ThreadGoalStatus::BudgetLimited
-            | ThreadGoalStatus::Complete => Self::Terminal,
-        };
-    }
 }
 
 enum StdinPromptBehavior {
@@ -967,7 +941,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let mut goal_state = ExecGoalState::Disabled;
+    let mut goal_state = ExecGoalState::default();
     let mut current_turn_id = None;
     let mut current_turn_active = false;
     match initial_operation {
@@ -1034,7 +1008,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     response.goal.status
                 ));
             }
-            goal_state = ExecGoalState::Active;
+            goal_state = ExecGoalState::activate(response.goal);
             info!("Started goal mode for thread {primary_thread_id_for_span}");
         }
         InitialOperation::Review { review_request } => {
@@ -1180,6 +1154,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     }
                 } else if goal_state.is_enabled() && !goal_state.is_active() && !current_turn_active
                 {
+                    eprintln!(
+                        "Goal execution stopped while idle: thread={primary_thread_id_for_requests}"
+                    );
                     if let Err(err) =
                         request_shutdown(&client, &mut request_ids, &primary_thread_id_for_requests)
                             .await
@@ -1193,6 +1170,21 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 let message = lagged_event_warning_message(skipped);
                 warn!("{message}");
                 event_processor.process_warning(message);
+                if goal_state.activation_pending() {
+                    // The activation snapshot may have been lost. Continuing
+                    // would leave all later goal terminal states behind the fence.
+                    error_seen = true;
+                    eprintln!(
+                        "Goal activation unconfirmed after losing {skipped} events: thread={primary_thread_id_for_requests}"
+                    );
+                    if let Err(err) =
+                        request_shutdown(&client, &mut request_ids, &primary_thread_id_for_requests)
+                            .await
+                    {
+                        warn!("thread/unsubscribe failed after goal activation event loss: {err}");
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1201,6 +1193,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         warn!("in-process app-server shutdown failed: {err}");
     }
     event_processor.print_final_output();
+    if goal_state.is_enabled() {
+        eprintln!(
+            "Goal execution exiting: thread={primary_thread_id_for_requests} activation_pending={} turn_active={current_turn_active} error_seen={error_seen}",
+            goal_state.activation_pending()
+        );
+    }
     if error_seen {
         std::process::exit(1);
     }
@@ -1445,6 +1443,7 @@ fn update_goal_mode_tracking(
         ServerNotification::TurnStarted(notification) if notification.thread_id == thread_id => {
             let turn_id = notification.turn.id.clone();
             exec_span.record("turn.id", turn_id.as_str());
+            eprintln!("Goal execution turn started: thread={thread_id} turn={turn_id}");
             *current_turn_id = Some(turn_id);
             *current_turn_active = true;
         }
@@ -1452,17 +1451,21 @@ fn update_goal_mode_tracking(
             if notification.thread_id == thread_id
                 && turn_id_matches(notification.turn.id.as_str(), current_turn_id.as_deref()) =>
         {
+            eprintln!(
+                "Goal execution turn ended: thread={thread_id} turn={} status={:?}",
+                notification.turn.id, notification.turn.status
+            );
             *current_turn_active = false;
         }
         ServerNotification::ThreadGoalUpdated(notification)
             if notification.thread_id == thread_id =>
         {
-            goal_state.update_from_status(notification.goal.status);
+            goal_state.update_from_goal(&notification.goal);
         }
         ServerNotification::ThreadGoalCleared(notification)
             if notification.thread_id == thread_id =>
         {
-            *goal_state = ExecGoalState::Terminal;
+            goal_state.clear();
         }
         _ => {}
     }
