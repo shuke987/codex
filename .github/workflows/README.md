@@ -11,11 +11,13 @@ matching code-mode host, runs all exec and code-mode-host tests, and checks
 formatting, unused dependencies and scoped Clippy. It also runs after pushes
 to `codex/exec-goal`. Its debug build is a CI smoke artifact, not a release.
 
-The upstream full-platform Bazel and Rust workflows remain available through
+The upstream full-platform Bazel, Rust and V8 workflows remain available through
 manual dispatch. They are not part of the fork's Linux maintenance contract;
 in particular, Windows voice-host builds have additional MSVC runtime license
 and native-toolchain prerequisites. No cross-platform passing result should
 be inferred from the Linux gate. Official repository checks remain unchanged.
+Fork PRs use checksum-verified official V8 artifacts in the Linux build and
+candidate smoke tests, without invoking the upstream V8 source-build matrix.
 
 The final required check verifies every active dependency. Only the explicitly
 inactive profile may be skipped; a skipped, cancelled or failed Linux test job
