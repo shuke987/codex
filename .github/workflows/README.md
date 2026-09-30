@@ -28,8 +28,10 @@ still fails the fork's merge gate.
 lowercase commit SHA in `source_ref`; leaving it empty resolves the current
 `codex/exec-goal` head once at the start. Only commits already on that maintenance
 branch are accepted. The workflow and smoke-test revision are recorded separately
-from the selected source revision. Pull requests changing the workflow or its
-smoke script also exercise the candidate build against the maintenance head.
+from the selected source revision. Pull requests changing the runtime version,
+lockfile, exec/code-mode-host code, package builder, workflow or smoke script build
+the exact PR head instead of the maintenance head. The run name and artifact
+provenance identify that immutable source commit.
 
 GitHub requires a workflow-dispatch entrypoint on the default branch. This fork uses
 `codex/exec-goal` as its default, retaining `main` for upstream tracking. The Run

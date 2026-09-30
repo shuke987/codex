@@ -1,5 +1,5 @@
 name: fork-release-candidate
-run-name: Linux x64 release candidate (${{ inputs.source_ref || 'maintenance branch head' }})
+run-name: Linux x64 release candidate (${{ github.event.pull_request.head.sha || inputs.source_ref || 'maintenance branch head' }})
 
 on:
   workflow_dispatch:
@@ -13,6 +13,12 @@ on:
     paths:
       - .github/workflows/fork-release-candidate.yml
       - .github/scripts/smoke-fork-release.py
+      - .github/scripts/test_fork_release_source.py
+      - codex-rs/Cargo.toml
+      - codex-rs/Cargo.lock
+      - codex-rs/exec/**
+      - codex-rs/code-mode-host/**
+      - scripts/codex_package/**
 
 permissions:
   contents: read
@@ -41,12 +47,19 @@ jobs:
         id: source
         env:
           REQUESTED_REF: ${{ inputs.source_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           cp .github/scripts/smoke-fork-release.py "$RUNNER_TEMP/smoke-fork-release.py"
           git fetch --no-tags origin codex/exec-goal:refs/remotes/origin/codex/exec-goal
           source_sha="$(git rev-parse refs/remotes/origin/codex/exec-goal)"
-          if [[ -n "$REQUESTED_REF" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            # The checkout includes the PR head, even when Actions initially
+            # checked out a synthetic merge commit. Build the exact PR revision.
+            [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'PR head must be a full lowercase commit SHA'; exit 1; }
+            git cat-file -e "${PR_HEAD_SHA}^{commit}"
+            source_sha="$PR_HEAD_SHA"
+          elif [[ -n "$REQUESTED_REF" ]]; then
             [[ "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_ref must be a full lowercase commit SHA'; exit 1; }
             git cat-file -e "${REQUESTED_REF}^{commit}"
             git merge-base --is-ancestor "$REQUESTED_REF" refs/remotes/origin/codex/exec-goal
@@ -55,7 +68,7 @@ jobs:
           git checkout --detach "$source_sha"
           echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
-          echo "Building reviewed maintenance commit $source_sha" >> "$GITHUB_STEP_SUMMARY"
+          echo "Building candidate source commit $source_sha" >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/setup-ci
         id: setup_ci
       - name: Install Linux build dependencies
