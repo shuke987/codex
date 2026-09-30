@@ -50,11 +50,14 @@ jobs:
           cargo fmt -- --config imports_granularity=Item --check
           cargo shear --deny-warnings
           just bench-smoke
+      - name: Test candidate source selection
+        working-directory: .
+        run: python3 -m unittest discover -s .github/scripts -p 'test_fork_release_source.py'
       - name: Build the complete CLI and matching code-mode host
         run: cargo build --locked -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
       - name: Verify CLI identity and goal entry point
         run: |
-          "$CARGO_TARGET_DIR/debug/codex" --version | grep -Fx 'codex-cli 0.156.1'
+          "$CARGO_TARGET_DIR/debug/codex" --version | grep -Fx 'codex-cli 0.159.2'
           "$CARGO_TARGET_DIR/debug/codex" exec --help | grep -q -- '--goal'
           test -x "$CARGO_TARGET_DIR/debug/codex-code-mode-host"
       - name: Run exec and code-mode host regressions

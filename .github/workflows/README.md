@@ -11,11 +11,13 @@ matching code-mode host, runs all exec and code-mode-host tests, and checks
 formatting, unused dependencies and scoped Clippy. It also runs after pushes
 to `codex/exec-goal`. Its debug build is a CI smoke artifact, not a release.
 
-The upstream full-platform Bazel and Rust workflows remain available through
+The upstream full-platform Bazel, Rust and V8 workflows remain available through
 manual dispatch. They are not part of the fork's Linux maintenance contract;
 in particular, Windows voice-host builds have additional MSVC runtime license
 and native-toolchain prerequisites. No cross-platform passing result should
 be inferred from the Linux gate. Official repository checks remain unchanged.
+Fork PRs use checksum-verified official V8 artifacts in the Linux build and
+candidate smoke tests, without invoking the upstream V8 source-build matrix.
 
 The final required check verifies every active dependency. Only the explicitly
 inactive profile may be skipped; a skipped, cancelled or failed Linux test job
@@ -28,8 +30,10 @@ still fails the fork's merge gate.
 lowercase commit SHA in `source_ref`; leaving it empty resolves the current
 `codex/exec-goal` head once at the start. Only commits already on that maintenance
 branch are accepted. The workflow and smoke-test revision are recorded separately
-from the selected source revision. Pull requests changing the workflow or its
-smoke script also exercise the candidate build against the maintenance head.
+from the selected source revision. Pull requests changing the runtime version,
+lockfile, exec/code-mode-host code, package builder, workflow or smoke script build
+the exact PR head instead of the maintenance head. The run name and artifact
+provenance identify that immutable source commit.
 
 GitHub requires a workflow-dispatch entrypoint on the default branch. This fork uses
 `codex/exec-goal` as its default, retaining `main` for upstream tracking. The Run

@@ -15,6 +15,9 @@ concurrency:
 
 jobs:
   metadata:
+    # Fork PRs validate the checksum-verified upstream V8 artifacts through
+    # fork-exec-ci and fork-release-candidate, without upstream-only runners.
+    if: github.repository == 'openai/codex' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       # Older revisions can contain a detector that does not emit this output.
