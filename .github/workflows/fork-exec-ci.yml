@@ -57,7 +57,7 @@ jobs:
         run: cargo build --locked -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
       - name: Verify CLI identity and goal entry point
         run: |
-          "$CARGO_TARGET_DIR/debug/codex" --version | grep -Fx 'codex-cli 0.159.2'
+          "$CARGO_TARGET_DIR/debug/codex" --version | grep -Fx 'codex-cli 0.162.1'
           "$CARGO_TARGET_DIR/debug/codex" exec --help | grep -q -- '--goal'
           test -x "$CARGO_TARGET_DIR/debug/codex-code-mode-host"
       - name: Run exec and code-mode host regressions
