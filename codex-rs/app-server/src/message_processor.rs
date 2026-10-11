@@ -333,6 +333,8 @@ impl MessageProcessor {
                     Arc::clone(&extension_event_sink),
                 ))
             });
+            let time_provider =
+                app_server_time_provider(outgoing.clone(), thread_state_manager.clone());
             let manager = ThreadManager::new(
                 config.as_ref(),
                 auth_manager.clone(),
@@ -366,11 +368,7 @@ impl MessageProcessor {
                     outgoing.clone(),
                     thread_state_manager.clone(),
                 )),
-                Some({
-                    let time_provider =
-                        app_server_time_provider(outgoing.clone(), thread_state_manager.clone());
-                    time_provider
-                }),
+                Some(time_provider),
             );
             match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
