@@ -49,7 +49,8 @@ jobs:
         run: |
           cargo fmt -- --config imports_granularity=Item --check
           cargo shear --deny-warnings
-          just bench-smoke
+          just bench --locked -- --test
+          git diff --exit-code -- Cargo.lock
       - name: Test candidate source selection
         working-directory: .
         run: python3 -m unittest discover -s .github/scripts -p 'test_fork_release_source.py'
@@ -66,7 +67,7 @@ jobs:
           "$CARGO_TARGET_DIR/debug/codex" exec --help | grep -q -- '--goal'
           test -x "$CARGO_TARGET_DIR/debug/codex-code-mode-host"
       - name: Run exec and code-mode host regressions
-        run: just test --locked -p codex-exec -p codex-code-mode-host --test-threads 2
+        run: just test --locked --profile default -p codex-exec -p codex-code-mode-host --test-threads 2
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: "0.13.5"
@@ -90,8 +91,8 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: linux-exec-goal-test-results
-          path: ${{ env.CARGO_TARGET_DIR }}/nextest/local/junit.xml
-          if-no-files-found: warn
+          path: ${{ env.CARGO_TARGET_DIR }}/nextest/default/junit.xml
+          if-no-files-found: error
       - name: Check for a clean worktree
         if: always() && !cancelled()
         uses: ./.github/actions/check-clean-worktree
