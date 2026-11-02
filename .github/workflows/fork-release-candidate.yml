@@ -18,6 +18,8 @@ on:
       - codex-rs/Cargo.lock
       - codex-rs/exec/**
       - codex-rs/code-mode-host/**
+      - codex-rs/exec-server-cli/**
+      - codex-rs/exec-server/**
       - scripts/codex_package/**
 
 permissions:
@@ -89,12 +91,13 @@ jobs:
             ~/.cargo/git
             ${{ steps.setup_ci.outputs.cargo-target-dir }}
           key: fork-release-gnu-x64-rust195-debug0-v1-${{ hashFiles('codex-rs/Cargo.lock') }}
-      - name: Build release CLI, host and sandbox helper
+      - name: Build release CLI, host, executor and sandbox helper
         working-directory: codex-rs
         run: |
           cargo build --locked --release --target "$TARGET" \
             -p codex-cli --bin codex \
             -p codex-code-mode-host --bin codex-code-mode-host \
+            -p codex-exec-server-cli --bin codex-exec-server \
             -p codex-bwrap --bin bwrap
       - name: Assemble canonical package and provenance
         id: package
@@ -102,9 +105,10 @@ jobs:
           set -euo pipefail
           package="$RUNNER_TEMP/codex-package"
           binaries="$CARGO_TARGET_DIR/$TARGET/release"
-          just assemble-codex-package --target "$TARGET" --package-dir "$package" \
+          just assemble-codex-package --target "$TARGET" --cargo-profile release --package-dir "$package" \
             --entrypoint-bin "$binaries/codex" \
             --code-mode-host-bin "$binaries/codex-code-mode-host" \
+            --exec-server-bin "$binaries/codex-exec-server" \
             --bwrap-bin "$binaries/bwrap"
           export PACKAGE_DIR="$package"
           python3 - <<'PY'
@@ -171,6 +175,6 @@ jobs:
             echo "Source commit: $SOURCE_SHA"
             echo 'Download the artifact from this run and verify SHA256SUMS before extracting.'
             echo 'Built on Ubuntu 24.04 (GNU libc); compatibility with older Linux systems is not implied.'
-            echo 'Includes CLI, code-mode host, bwrap, ripgrep and the supported patched zsh resource.'
+            echo 'Includes CLI, code-mode host, standalone executor, bwrap and ripgrep.'
             echo 'Candidate only: no GitHub Release, tag, OSS upload or production replacement.'
           } >> "$GITHUB_STEP_SUMMARY"

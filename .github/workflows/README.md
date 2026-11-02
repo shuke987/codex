@@ -7,8 +7,10 @@ The workflows in this directory are split so that pull requests get fast, review
 Outside `openai/codex`, `blocking-ci.yml` requires the shared repository,
 spelling, dependency-policy and blob-size checks plus `fork-exec-ci.yml`.
 The fork job runs on standard Linux x64 hardware, builds the full CLI and its
-matching code-mode host, runs all exec and code-mode-host tests, and checks
-formatting, unused dependencies and scoped Clippy. It also runs after pushes
+matching code-mode host and standalone executor, runs all exec and code-mode-host tests, and checks
+formatting, unused dependencies and scoped Clippy. It also assembles a complete
+debug package and verifies code-mode tool execution plus same-thread goal recovery
+for both ordinary overload and policy-restricted capacity errors. It runs after pushes
 to `codex/exec-goal`. Its debug build is a CI smoke artifact, not a release.
 
 The upstream full-platform Bazel, Rust and V8 workflows remain available through
@@ -46,9 +48,10 @@ gh workflow run fork-release-candidate.yml --repo shuke987/codex \
 
 The job uses locked Cargo dependencies and checksum-verified V8/resources, builds
 with the release profile (debug information disabled), and assembles the canonical
-CLI package, including the matching code-mode host, bwrap, ripgrep and patched zsh.
+CLI package, including the matching code-mode host, standalone executor, bwrap and
+ripgrep. Codex 0.166 uses the standard shell executor and no longer ships patched zsh.
 It extracts the final archive, verifies checksums, and runs an isolated local-model
-smoke test: capacity failure, resume of the same thread, packaged ripgrep execution
+smoke test for each capacity error: failure, resume of the same thread, packaged ripgrep execution
 through code mode, goal completion and a successful terminal event.
 
 Successful runs upload a 30-day Actions artifact with the `.tar.gz`, `SHA256SUMS`
