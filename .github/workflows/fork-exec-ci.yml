@@ -53,15 +53,36 @@ jobs:
       - name: Test candidate source selection
         working-directory: .
         run: python3 -m unittest discover -s .github/scripts -p 'test_fork_release_source.py'
-      - name: Build the complete CLI and matching code-mode host
-        run: cargo build --locked -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
+      - name: Build the CLI and matching package helpers
+        run: |
+          cargo build --locked \
+            -p codex-cli --bin codex \
+            -p codex-code-mode-host --bin codex-code-mode-host \
+            -p codex-exec-server-cli --bin codex-exec-server \
+            -p codex-bwrap --bin bwrap
       - name: Verify CLI identity and goal entry point
         run: |
-          "$CARGO_TARGET_DIR/debug/codex" --version | grep -Fx 'codex-cli 0.162.1'
+          "$CARGO_TARGET_DIR/debug/codex" --version | grep -Fx 'codex-cli 0.166.0'
           "$CARGO_TARGET_DIR/debug/codex" exec --help | grep -q -- '--goal'
           test -x "$CARGO_TARGET_DIR/debug/codex-code-mode-host"
       - name: Run exec and code-mode host regressions
         run: just test --locked -p codex-exec -p codex-code-mode-host --test-threads 2
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.5"
+      - name: Assemble and smoke test the complete debug package
+        working-directory: .
+        timeout-minutes: 10
+        run: |
+          package="$RUNNER_TEMP/codex-debug-package"
+          binaries="$CARGO_TARGET_DIR/debug"
+          just assemble-codex-package --target x86_64-unknown-linux-gnu --cargo-profile dev \
+            --package-dir "$package" --entrypoint-bin "$binaries/codex" \
+            --code-mode-host-bin "$binaries/codex-code-mode-host" \
+            --exec-server-bin "$binaries/codex-exec-server" --bwrap-bin "$binaries/bwrap"
+          export PYTHONPATH="$GITHUB_WORKSPACE/sdk/python/src:$GITHUB_WORKSPACE/sdk/python/tests"
+          uv run --locked --project scripts/codex_package/smoke_tests \
+            python .github/scripts/smoke-fork-release.py "$package"
       - name: Lint the modified exec crate
         run: cargo clippy --locked -p codex-exec --all-targets -- -D warnings
       - name: Upload test results

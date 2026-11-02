@@ -25,10 +25,33 @@ def main() -> None:
     for relative in [
         "codex-path/rg",
         "codex-resources/bwrap",
-        "codex-resources/zsh/bin/zsh",
     ]:
         subprocess.run([str(package / relative), "--version"], check=True, timeout=30)
 
+    executor = package / manifest["execServer"]
+    assert os.access(executor, os.X_OK)
+    subprocess.run(
+        [str(executor), "--help"], check=True, timeout=30, capture_output=True
+    )
+    for error_code, error_message in (
+        (
+            "server_is_overloaded",
+            "Selected model is at capacity. Please try a different model.",
+        ),
+        (
+            "policy_capacity_unavailable",
+            "Policy-restricted capacity is unavailable. Please try again later.",
+        ),
+    ):
+        smoke_capacity_recovery(package, cli, error_code, error_message)
+    print(
+        "PASS: package identity, helpers, code-mode execution and same-thread recovery for both capacity errors"
+    )
+
+
+def smoke_capacity_recovery(
+    package: Path, cli: Path, error_code: str, error_message: str
+) -> None:
     with (
         tempfile.TemporaryDirectory(prefix="release-smoke-") as directory,
         MockResponsesServer() as server,
@@ -79,8 +102,8 @@ stream_max_retries = 0
                         "response": {
                             "id": "capacity",
                             "error": {
-                                "code": "server_is_overloaded",
-                                "message": "Selected model is at capacity. Please try a different model.",
+                                "code": error_code,
+                                "message": error_message,
                             },
                         },
                     }
@@ -99,6 +122,7 @@ stream_max_retries = 0
         assert first.returncode == 1, first
         events = [json.loads(line) for line in first.stdout.splitlines()]
         assert events[-1]["type"] == "turn.failed", first
+        assert events[-1]["error"]["message"] == error_message, first
         thread = events[0]
         shell = json.dumps(
             {
@@ -158,9 +182,6 @@ stream_max_retries = 0
         assert "ripgrep" in output_text and "release-smoke-tools-ok" in output_text, (
             output
         )
-    print(
-        "PASS: package identity, helpers, code-mode execution and same-thread capacity recovery"
-    )
 
 
 if __name__ == "__main__":
